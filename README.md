@@ -13,8 +13,26 @@ The core idea is simple:
 - Harbor provides the benchmark runner, environment isolation, and verifier flow
 - Task verifiers write deterministic rewards so regressions are easy to detect
 
-This fork is set up to work with the local `codex` CLI by default, so it can run
-without an `OPENAI_API_KEY` as long as the machine is already logged into Codex.
+## Fork Notice
+
+This repository is based on the original
+[`kevinrgu/autoagent`](https://github.com/kevinrgu/autoagent) project and is
+maintained as a fork/customized continuation for local benchmark execution.
+
+The main fork-specific additions in this repository are:
+
+- a Codex-backed execution path in `agent.py`, so Harbor tasks can run through
+  the local `codex` CLI without requiring `OPENAI_API_KEY`
+- Python 3.12 alignment, `uv`-based dependency sync, and a committed `uv.lock`
+- a checked-in `.env.example` for local setup
+- three representative Harbor tasks in `tasks/` for end-to-end validation:
+  `infra-smoke-edit`, `python-bugfix`, and `csv-transform`
+- updated setup and usage documentation for local execution, Docker image
+  building, single-task runs, and full benchmark runs
+
+This means the repository preserves the original AutoAgent idea and structure,
+while adding a practical local execution path and a small benchmark suite for
+verifying that the Harbor loop actually works end to end.
 
 ## What This Can Automate
 

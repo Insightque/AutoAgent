@@ -14,7 +14,6 @@ __pycache__/
 results.tsv
 run.log
 jobs/
-tasks/
 tasks-archived/
 tasks-archived-sheets/
 tasks-sheets-verified/

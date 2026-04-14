@@ -2,9 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import os
+import shutil
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
+from types import SimpleNamespace
 
 from agents import Agent, Runner, function_tool
 from agents.items import (
@@ -28,6 +34,14 @@ from harbor.models.agent.context import AgentContext
 SYSTEM_PROMPT = "You are an agent that executes tasks"
 MODEL = "gpt-5"
 MAX_TURNS = 30
+CODEX_REASONING_EFFORT = "high"
+
+
+@dataclass
+class LocalRunResult:
+    new_items: list[object]
+    raw_responses: list[SimpleNamespace]
+    last_response_id: str | None = None
 
 
 def create_tools(environment: BaseEnvironment) -> list[FunctionTool]:
@@ -61,16 +75,183 @@ def create_agent(environment: BaseEnvironment) -> Agent:
     )
 
 
-async def run_task(
+def choose_backend() -> str:
+    """Select an execution backend for the task run."""
+    explicit = os.getenv("AUTOAGENT_BACKEND")
+    if explicit:
+        return explicit.lower()
+    if os.getenv("OPENAI_API_KEY"):
+        return "openai"
+    if shutil.which("codex"):
+        return "codex"
+    return "openai"
+
+
+def build_codex_prompt(instruction: str) -> str:
+    """Explain how the Harbor task container is mirrored into the local Codex workspace."""
+    normalized_instruction = instruction.replace("/app/", "./app/")
+    return (
+        f"{SYSTEM_PROMPT}\n\n"
+        "You are operating on a local mirror of a Harbor task container.\n"
+        "- The container path `/app` is mirrored locally at `./app`.\n"
+        "- When the task mentions `/app/...`, use `./app/...` in this workspace.\n"
+        "- Prefer changing only the files needed to complete the task.\n"
+        "- Finish only when the requested artifacts exist under `./app`.\n\n"
+        "Original task instruction:\n"
+        f"{instruction}\n\n"
+        "Normalized local instruction:\n"
+        f"{normalized_instruction}\n"
+    )
+
+
+def parse_codex_usage(stdout_text: str) -> tuple[str | None, Usage]:
+    """Extract thread id and token usage from Codex JSONL output."""
+    thread_id = None
+    usage = Usage()
+
+    for line in stdout_text.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+
+        if event.get("type") == "thread.started":
+            thread_id = event.get("thread_id")
+        elif event.get("type") == "turn.completed":
+            event_usage = event.get("usage", {})
+            input_tokens = int(event_usage.get("input_tokens", 0) or 0)
+            cached_input_tokens = int(event_usage.get("cached_input_tokens", 0) or 0)
+            output_tokens = int(event_usage.get("output_tokens", 0) or 0)
+            usage.requests += 1
+            usage.input_tokens += input_tokens
+            usage.output_tokens += output_tokens
+            usage.total_tokens += input_tokens + output_tokens
+            usage.input_tokens_details.cached_tokens += cached_input_tokens
+
+    return thread_id, usage
+
+
+async def run_openai_task(
     environment: BaseEnvironment,
     instruction: str,
 ) -> tuple[object, int]:
-    """Run the agent on a task and return (result, duration_ms)."""
+    """Run the original OpenAI Agents SDK harness."""
     agent = create_agent(environment)
     t0 = time.time()
     result = await Runner.run(agent, input=instruction, max_turns=MAX_TURNS)
     duration_ms = int((time.time() - t0) * 1000)
     return result, duration_ms
+
+
+async def run_codex_task(
+    environment: BaseEnvironment,
+    instruction: str,
+) -> tuple[LocalRunResult, int]:
+    """Mirror /app locally, let Codex operate on it, then sync the result back."""
+    codex_path = shutil.which("codex")
+    if not codex_path:
+        raise RuntimeError(
+            "AUTOAGENT_BACKEND=codex was requested, but `codex` is not available on PATH."
+        )
+
+    workspace_root = (Path(environment.trial_paths.agent_dir) / "codex_workspace").resolve()
+    app_root = workspace_root / "app"
+    prompt_path = workspace_root / "TASK.md"
+    stdout_path = workspace_root / "codex.stdout.jsonl"
+    stderr_path = workspace_root / "codex.stderr.log"
+    last_message_path = workspace_root / "codex.last_message.txt"
+
+    if workspace_root.exists():
+        shutil.rmtree(workspace_root)
+    app_root.mkdir(parents=True, exist_ok=True)
+    prompt_path.write_text(build_codex_prompt(instruction))
+
+    await environment.exec(command="mkdir -p /app /app/output", timeout_sec=30)
+
+    replace_remote_app = False
+    try:
+        await environment.download_dir(source_dir="/app", target_dir=app_root)
+        replace_remote_app = True
+    except Exception:
+        app_root.mkdir(parents=True, exist_ok=True)
+
+    command = [
+        codex_path,
+        "exec",
+        "--skip-git-repo-check",
+        "--sandbox",
+        "workspace-write",
+        "--json",
+        "-c",
+        f'model_reasoning_effort="{CODEX_REASONING_EFFORT}"',
+        "-m",
+        MODEL,
+        "-C",
+        str(workspace_root),
+        "-o",
+        str(last_message_path),
+        prompt_path.read_text(),
+    ]
+
+    t0 = time.time()
+    process = await asyncio.create_subprocess_exec(
+        *command,
+        cwd=str(workspace_root),
+        env=dict(os.environ),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout_bytes, stderr_bytes = await process.communicate()
+    duration_ms = int((time.time() - t0) * 1000)
+
+    stdout_text = stdout_bytes.decode(errors="replace") if stdout_bytes else ""
+    stderr_text = stderr_bytes.decode(errors="replace") if stderr_bytes else ""
+    stdout_path.write_text(stdout_text)
+    stderr_path.write_text(stderr_text)
+
+    if process.returncode != 0:
+        raise RuntimeError(
+            "Codex execution failed.\n"
+            f"Command: {' '.join(command)}\n"
+            f"Stdout:\n{stdout_text}\n"
+            f"Stderr:\n{stderr_text}"
+        )
+
+    if replace_remote_app:
+        await environment.exec(
+            command="find /app -mindepth 1 -maxdepth 1 -exec rm -rf {} +",
+            timeout_sec=120,
+        )
+    else:
+        await environment.exec(command="mkdir -p /app", timeout_sec=30)
+    await environment.upload_dir(source_dir=app_root, target_dir="/app")
+
+    thread_id, usage = parse_codex_usage(stdout_text)
+    raw_responses = []
+    if usage.requests or usage.total_tokens:
+        raw_responses.append(SimpleNamespace(usage=usage))
+
+    return LocalRunResult(
+        new_items=[],
+        raw_responses=raw_responses,
+        last_response_id=thread_id,
+    ), duration_ms
+
+
+async def run_task(
+    environment: BaseEnvironment,
+    instruction: str,
+) -> tuple[object, int]:
+    """Run the task through either OpenAI Agents SDK or Codex CLI."""
+    backend = choose_backend()
+    if backend == "codex":
+        return await run_codex_task(environment, instruction)
+    if backend == "openai":
+        return await run_openai_task(environment, instruction)
+    raise RuntimeError(f"Unsupported AUTOAGENT_BACKEND value: {backend}")
 
 
 # ============================================================================

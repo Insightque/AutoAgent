@@ -1,156 +1,222 @@
-<p align="center">
-  <a href="https://www.thirdlayer.inc">
-    <img src="https://www.thirdlayer.inc/thirdlayer-logo.svg" alt="thirdlayer" width="200">
-  </a>
-</p>
-
-<blockquote>
-<p>We're launching a product around self-configuring agents soon. <a href="https://form.typeform.com/to/ZQbnbO09">Sign up here.</a><br>We're hiring engineers. If this work interests you, reach out to <a href="mailto:hello@thirdlayer.inc">hello@thirdlayer.inc</a> with your Github link.</p>
-</blockquote>
-
 # AutoAgent
 
-> Like autoresearch but for agent engineering. Give an AI agent a task, let it build and iterate on an agent harness autonomously overnight. It modifies the system prompt, tools, agent configuration, and orchestration, runs the benchmark, checks the score, keeps or discards the change, and repeats.
+AutoAgent is a Harbor-compatible harness for benchmark-driven agent engineering.
+You give it benchmark tasks, it runs an autonomous coding agent against those
+tasks, and Harbor records deterministic scores for each run.
 
 ![teaser](progress.png)
 
-The core idea is the same: you're not touching the harness Python files like you normally would as an engineer. Instead, you program `program.md`, the Markdown file that provides context to the meta-agent and defines the agent-engineering loop.
+The core idea is simple:
 
-## How it works
+- Humans define the optimization goal in `program.md`
+- The runnable harness lives in `agent.py`
+- Harbor provides the benchmark runner, environment isolation, and verifier flow
+- Task verifiers write deterministic rewards so regressions are easy to detect
 
-The repo has a few files and directories that matter:
+This fork is set up to work with the local `codex` CLI by default, so it can run
+without an `OPENAI_API_KEY` as long as the machine is already logged into Codex.
 
-- **`agent.py`** -- the entire harness under test in a single file. It contains
-  config, tool definitions, agent registry, routing/orchestration, and the
-  Harbor adapter boundary. The adapter section is explicitly marked as fixed;
-  the rest is the primary edit surface for the meta-agent.
-- **`program.md`** -- instructions for the meta-agent + the directive (what
-  kind of agent to build). **This file is edited by the human**.
-- **`tasks/`** -- evaluation tasks in
-  [harbor](https://github.com/laude-institute/harbor) format. In a clean
-  baseline branch, benchmark payloads may be omitted and added in
-  benchmark-specific branches.
-- **`.agent/`** -- optional workspace artifacts for reusable instructions,
-  notes, prompts, or skills.
+## What This Can Automate
 
-The metric is total **score** produced by the benchmark's task test suites. The
-meta-agent hill-climbs on this score.
+AutoAgent is useful anywhere you want an agent to work on reproducible tasks and
+be judged automatically. Typical examples:
 
-## Quick start
+- Infra smoke checks that verify the benchmark loop itself is wired correctly
+- Code repair tasks such as fixing a Python bug and rerunning `pytest`
+- Data transformation tasks such as converting CSV input into exact JSON output
+- Regression suites for an autonomous coding agent
+- Agent harness experiments where prompt, tooling, or orchestration changes are
+  evaluated by score instead of by intuition
+- Overnight hill-climbing loops where a meta-agent iterates on the harness and
+  keeps only changes that improve benchmark results
 
-**Requirements:** Docker, Python 3.10+, [uv](https://docs.astral.sh/uv/), and
-whatever model-provider credentials your current `agent.py` harness requires.
+## How It Works
+
+The important files are:
+
+- `agent.py`: single-file runnable harness under test
+- `program.md`: instructions for the meta-agent that improves the harness
+- `tasks/`: Harbor-format benchmark tasks
+- `Dockerfile.base`: shared base image for task environments
+- `jobs/`: Harbor job outputs, verifier logs, and trajectories
+
+At runtime:
+
+1. Harbor loads a task from `tasks/`
+2. Harbor builds the task environment from `environment/Dockerfile`
+3. `agent:AutoAgent` receives the task instruction
+4. The harness runs either:
+   - the OpenAI Agents SDK backend when `OPENAI_API_KEY` is set, or
+   - the local `codex` CLI backend when `AUTOAGENT_BACKEND=codex` or no OpenAI
+     key is present
+5. The agent reads files, runs commands, edits outputs, and finishes
+6. The task verifier runs deterministic checks and writes `/logs/verifier/reward.txt`
+7. Harbor aggregates rewards into per-task and per-job scores
+
+For the Codex backend, the Harbor container's `/app` directory is mirrored into a
+local workspace, `codex exec` works against that mirror, and the modified files
+are synced back into the task container before the verifier runs.
+
+## Included Benchmark Tasks
+
+This repository already includes three representative tasks:
+
+- `infra-smoke-edit`: edits a small text file and writes an exact output file
+- `python-bugfix`: fixes an off-by-one bug and passes deterministic `pytest`
+- `csv-transform`: reads CSV input and produces an exact JSON summary
+
+These tasks validate that the full loop works:
+
+- task loading
+- shell execution
+- file editing and output creation
+- deterministic verifier scoring
+- Harbor result aggregation
+
+## Quick Start
+
+Requirements:
+
+- Python 3.12
+- Docker
+- `uv`
+- local `codex` CLI installed and logged in, or a valid `OPENAI_API_KEY`
+
+Setup:
 
 ```bash
-# 1. Install uv (if you don't have it)
-curl -LsSf https://astral.sh/uv/install.sh | sh
-
-# 2. Install dependencies
+# 1. Install dependencies
 uv sync
 
-# 3. Set up the environment variables required by your current agent/runtime
-# Example:
-cat > .env << 'EOF'
-OPENAI_API_KEY=...
-EOF
+# 2. Prepare local environment config
+cp .env.example .env
 
-# 4. Build base image
+# 3. Build the shared base image
 docker build -f Dockerfile.base -t autoagent-base .
 
-# 5. Add tasks to tasks/ (see Task format section below)
-
-# 6. Run a single benchmark task
-rm -rf jobs; mkdir -p jobs && uv run harbor run -p tasks/ --task-name "<task-name>" -l 1 -n 1 --agent-import-path agent:AutoAgent -o jobs --job-name latest > run.log 2>&1
-
-# 7. Run all tasks in parallel (-n = concurrency, default 4)
-rm -rf jobs; mkdir -p jobs && uv run harbor run -p tasks/ -n 100 --agent-import-path agent:AutoAgent -o jobs --job-name latest > run.log 2>&1
+# 4. Check the Harbor agent import path
+uv run python -c "from agent import AutoAgent; print(f'{AutoAgent.__module__}:{AutoAgent.__name__}')"
 ```
 
-## Running the meta-agent
+Run a single task:
 
-Point your coding agent at the repo and prompt:
-
+```bash
+rm -rf jobs
+mkdir -p jobs
+uv run harbor run -p tasks/ -i "infra-smoke-edit" -l 1 -n 1 \
+  --agent-import-path agent:AutoAgent -o jobs --job-name latest > run.log 2>&1
 ```
+
+Run the full representative benchmark:
+
+```bash
+rm -rf jobs
+mkdir -p jobs
+uv run harbor run -p tasks/ -n 3 \
+  --agent-import-path agent:AutoAgent -o jobs --job-name latest > run.log 2>&1
+```
+
+Results are written to:
+
+- `run.log`
+- `jobs/<job-name>/result.json`
+- `jobs/<job-name>/<trial-name>/verifier/reward.txt`
+- `jobs/<job-name>/<trial-name>/agent/trajectory.json`
+
+## Backend Selection
+
+Backend selection is automatic:
+
+- if `OPENAI_API_KEY` is set, the harness uses the OpenAI Agents SDK backend
+- otherwise, if `codex` is available on `PATH`, the harness uses the Codex backend
+- you can override this with `AUTOAGENT_BACKEND=codex` or `AUTOAGENT_BACKEND=openai`
+
+Recommended local setup:
+
+```bash
+codex login status
+cat .env
+```
+
+Example `.env`:
+
+```bash
+OPENAI_API_KEY=
+AUTOAGENT_BACKEND=codex
+```
+
+## Running the Meta-Agent
+
+The benchmark harness and the meta-agent loop are intentionally separated.
+To run harness-improvement iterations, point a coding agent at this repo and use
+the instructions in `program.md`.
+
+Example prompt:
+
+```text
 Read program.md and let's kick off a new experiment!
 ```
 
-The meta-agent will read the directive, inspect the current harness, run the
-benchmark, diagnose failures, modify `agent.py`, and iterate.
+The meta-agent should modify only the editable section of `agent.py`. The fixed
+Harbor adapter boundary must remain untouched unless a human explicitly asks for
+changes there.
 
-## Project structure
+## Task Format
 
-```text
-agent.py                       -- single-file harness under test
-  editable harness section     -- prompt, registries, tools, routing
-  fixed adapter section        -- Harbor integration + trajectory serialization
-program.md                     -- meta-agent instructions + directive
-Dockerfile.base                -- base image
-.agent/                        -- optional agent workspace artifacts
-tasks/                         -- benchmark tasks, typically added in benchmark-specific branches
-jobs/                          -- Harbor job outputs
-results.tsv                    -- experiment log (created by meta-agent, gitignored)
-run.log                        -- latest run output
-```
-
-## Task format
-
-The repo ships without tasks. Add your own to `tasks/` following [Harbor's task format](https://harborframework.com/docs/tasks):
+Tasks follow Harbor's local task structure:
 
 ```text
 tasks/my-task/
-  task.toml           -- config (timeouts, metadata)
-  instruction.md      -- prompt sent to the agent
-  tests/
-    test.sh           -- entry point, writes /logs/reward.txt
-    test.py           -- verification (deterministic or LLM-as-judge)
+  task.toml
+  instruction.md
   environment/
-    Dockerfile        -- task container (FROM autoagent-base)
-  files/              -- reference files mounted into container
+    Dockerfile
+  tests/
+    test.sh
+    test.py
+  files/
+    input assets used by the task
 ```
 
-Tests write a score (0.0-1.0) to the verifier logs. The meta-agent hill-climbs
-on this. See the [Harbor docs](https://harborframework.com/docs) for full details on writing and porting tasks.
+In this repo, the `files/` directory is committed as task reference data, and the
+task `environment/Dockerfile` places the runnable copies under `/app/files` so
+the baseline harness can access them directly.
 
-## Design choices
+## Project Structure
 
-- **Program the meta-agent, not the harness directly.** The human steers the
-  loop through `program.md`, while the meta-agent edits `agent.py`.
-- **Single-file, registry-driven harness.** The implementation lives in one
-  file for simplicity, but agent and tool registration stay structured so the
-  harness can still evolve cleanly.
-- **Docker isolation.** The agent runs in a container. It can't damage the host.
-- **Score-driven.** Every experiment produces a numeric score. Keep if better,
-  discard if not. Same loop as autoresearch.
-- **Harbor-compatible tasks.** Tasks use the same format as harbor benchmarks,
-  so the same harness can be evaluated on different datasets.
+```text
+agent.py
+program.md
+Dockerfile.base
+.env.example
+tasks/
+jobs/
+run.log
+progress.png
+```
+
+## Design Principles
+
+- Benchmark first: trust task scores over intuition
+- Keep the harness simple: most behavior lives in one file
+- Preserve the Harbor adapter boundary: edit only the intended section
+- Prefer deterministic verifiers for smoke and capability tests
+- Use Docker isolation so task execution cannot damage the host system
 
 ## Cleanup
 
-Docker images and containers accumulate across runs. Clean up regularly:
-
 ```bash
-# Harbor's cached task images + task cache
 uv run harbor cache clean -f
-
-# Full Docker nuke (all unused images, build cache, etc.)
-docker system prune -a -f
-
-# Lighter: just dead containers
 docker container prune -f
+docker system prune -a -f
 ```
 
-If Docker becomes unresponsive (for example after many concurrent runs), restart
-Docker Desktop:
+If Docker becomes unhealthy:
 
 ```bash
 killall Docker && open -a Docker
 ```
 
-## Improving performance with skills
-
-You can equip the agent with [Agent Skills for Context Engineering](https://github.com/muratcankoylan/Agent-Skills-for-Context-Engineering) and [context7](https://github.com/upstash/context7) skills to improve performance.
-
 ## License
 
 MIT
-
